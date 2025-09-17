@@ -314,8 +314,7 @@ class AsyncvLLMServer(AsyncServerBase):
             return JSONResponse(content=generator.model_dump())
 
     async def generate(self, prompt_ids: list[int], sampling_params: dict[str, Any], request_id: str) -> list[int]:
-        max_tokens = self.max_model_len - len(prompt_ids)
-        sampling_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
+        sampling_params = SamplingParams(**sampling_params, skip_special_tokens=False, include_stop_str_in_output=True)
         prompt = TokensPrompt(prompt_token_ids=prompt_ids)
         generator = self.engine.generate(prompt=prompt, sampling_params=sampling_params, request_id=request_id)
 
@@ -325,7 +324,7 @@ class AsyncvLLMServer(AsyncServerBase):
             final_res = output
         assert final_res is not None
 
-        return final_res.outputs[0].token_ids
+        return final_res
 
     async def wake_up(self):
         if self.config.rollout.free_cache_engine:
