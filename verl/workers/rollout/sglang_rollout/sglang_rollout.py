@@ -463,7 +463,8 @@ class SGLangRollout(BaseRollout):
                 mm_attention_backend="fa3",
                 attention_backend="fa3",
                 # In async mode, we want token in token out.
-                skip_tokenizer_init=self.config.mode == "async",
+                # skip_tokenizer_init=self.config.mode == "async",
+                skip_tokenizer_init=False,
             )
         else:
             self._engine = None
@@ -1003,13 +1004,9 @@ class SGLangRollout(BaseRollout):
     async def _handle_engine_generate(
         self, generation_prompt_ids: list[int], sampling_params: dict, image_data: Optional[list[Any]] = None
     ) -> dict:
-        max_new_tokens = min(self.config.response_length, self.config.max_model_len - len(generation_prompt_ids) - 1)
-        kwargs = sampling_params.copy()
-        kwargs["max_new_tokens"] = max_new_tokens
-        kwargs["n"] = 1  # group size is supported in preprocess
         output = await self._engine.async_generate(
             input_ids=generation_prompt_ids,
-            sampling_params=kwargs,
+            sampling_params=sampling_params,
             return_logprob=False,
             image_data=image_data,
         )
@@ -1383,10 +1380,8 @@ class SGLangRollout(BaseRollout):
     async def generate(
         self, prompt_ids: torch.Tensor, sampling_params: dict[str, Any], request_id: str
     ) -> torch.Tensor:
-        request_sampling_params = self.sampling_params.copy()
-        request_sampling_params.update(sampling_params)
-        output = await self._handle_engine_generate(prompt_ids, request_sampling_params)
-        return output["output_ids"]
+        output = await self._handle_engine_generate(prompt_ids, sampling_params)
+        return output
 
     async def wake_up(self):
         if not self.is_sleep:
