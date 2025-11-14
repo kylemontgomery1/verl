@@ -379,9 +379,14 @@ def apply_monkey_patch(
             Glm4vTextModel,
         )
 
-        from verl.models.transformers.glm4v import forward_with_normal_backend, glm4v_base_forward
+        from verl.models.transformers.glm4v import (
+            forward_with_normal_backend,
+            glm4v_base_forward,
+            glm4v_text_forward,
+        )
 
         Glm4vModel.forward = glm4v_base_forward
+        Glm4vTextModel.forward = glm4v_text_forward
         Glm4vForConditionalGeneration.forward = forward_with_normal_backend
         print(f"Monkey patch {model.__class__.__name__} model forward")
 
