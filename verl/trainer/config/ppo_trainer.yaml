@@ -26,6 +26,15 @@ defaults:
   # Model config.
   - model@actor_rollout_ref.model: hf_model
 
+  # Separate world-model actor.
+  - actor@world_model_actor.actor: ${model_engine}_actor
+
+  # Separate world-model rollout config.
+  - rollout@world_model_actor.rollout: rollout
+
+  # Separate world-model model config.
+  - model@world_model_actor.model: hf_model
+
   # Critic model config.
   - critic@critic: ${model_engine}_critic
   - model@critic.model: hf_model
@@ -57,6 +66,42 @@ actor_rollout_ref:
 
   # Timeout for operations executed against the process group
   nccl_timeout: 600
+
+# Config for a separately trained world model with disjoint weights and resources.
+world_model_actor:
+
+  # Whether to train and serve the separate world model.
+  enable: false
+
+  # Whether it is a hybrid engine with colocated training and rollout.
+  hybrid_engine: true
+
+  # Timeout for operations executed against the process group.
+  nccl_timeout: 600
+
+  # Dedicated resource pool for the world model.
+  resource:
+
+    # Number of world-model nodes.
+    nnodes: 1
+
+    # Number of world-model GPUs per node.
+    n_gpus_per_node: 8
+
+  # World-model rollout extensions.
+  rollout:
+
+    # Number of nodes in the world-model worker group.
+    nnodes: ${world_model_actor.resource.nnodes}
+
+    # Number of GPUs per world-model node.
+    n_gpus_per_node: ${world_model_actor.resource.n_gpus_per_node}
+
+    # Rollout implementation-specific settings.
+    custom:
+
+      # Namespace for server actors and local IPC endpoints.
+      server_name_suffix: world_model
 
 # config for the algorithm
 algorithm:
@@ -156,6 +201,9 @@ trainer:
 
   # Directory for logging rollout data; no dump if null
   rollout_data_dir: null
+
+  # Directory for serialized ordered rollout batches; no dump if null.
+  rollout_batch_data_dir: null
 
   # Directory for logging validation data; no dump if null
   validation_data_dir: null

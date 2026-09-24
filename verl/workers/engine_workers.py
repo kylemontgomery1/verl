@@ -706,6 +706,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="world_model_update")
+    @_with_routing_replay_flag(enabled=True)
+    def update_world_model(self, data: TensorDict) -> TensorDict:
+        data["loss_mask"] = data["world_loss_mask"]
+        output = self.actor.train_mini_batch(data=data)
+        return output.cpu() if output is not None else None
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         assert "actor" in self.role, "load_checkpoint only support actor role"

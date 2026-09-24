@@ -124,6 +124,7 @@ class vLLMHttpServer:
 
         os.environ[get_visible_devices_keyword()] = cuda_visible_devices
         os.environ["VERL_REPLICA_RANK"] = str(replica_rank)
+        os.environ["VERL_REPLICA_NAMESPACE"] = (config.get("custom") or {}).get("server_name_suffix", "")
         # Forward the Ray job id into the vLLM worker subprocess so the
         # colocated weight-transfer IPC socket path is unique per Ray job.
         # Without this, two concurrent verl jobs on the same node both bind
@@ -508,6 +509,35 @@ class vLLMHttpServer:
         self.task = asyncio.create_task(asyncio.to_thread(run_headless_wrapper))
         self.task.add_done_callback(on_run_headless_done)
 
+    @staticmethod
+    def _request_metrics(final_res, prompt_tokens: int, gen_tokens: int) -> dict[str, Any]:
+        metrics = getattr(final_res, "metrics", None)
+        cached_tokens = getattr(final_res, "num_cached_tokens", None)
+        if cached_tokens is None and metrics is not None:
+            cached_tokens = getattr(metrics, "num_cached_tokens", None)
+        output: dict[str, Any] = {
+            "prompt_tokens": int(prompt_tokens),
+            "cached_tokens": int(cached_tokens or 0),
+            "gen_tokens": int(gen_tokens),
+            "queue_sec": None,
+            "prefill_sec": None,
+            "decode_sec": None,
+        }
+        if metrics is None:
+            return output
+
+        queued = getattr(metrics, "queued_ts", 0.0) or 0.0
+        scheduled = getattr(metrics, "scheduled_ts", 0.0) or 0.0
+        first = getattr(metrics, "first_token_ts", 0.0) or 0.0
+        last = getattr(metrics, "last_token_ts", 0.0) or 0.0
+        if scheduled > 0.0 and queued > 0.0:
+            output["queue_sec"] = scheduled - queued
+        if first > 0.0 and scheduled > 0.0:
+            output["prefill_sec"] = first - scheduled
+        if last > 0.0 and first > 0.0:
+            output["decode_sec"] = last - first
+        return output
+
     async def generate(
         self,
         prompt_ids: list[int],
@@ -686,6 +716,7 @@ class vLLMHttpServer:
                 extra_fields["spec_num_draft_tokens"] = spec_decode_stats.num_draft_tokens
                 extra_fields["spec_num_accepted_tokens"] = spec_decode_stats.num_accepted_tokens
                 extra_fields["spec_num_verify_steps"] = spec_decode_stats.num_verify_steps
+        extra_fields["request_metrics"] = self._request_metrics(final_res, len(prompt_ids), len(token_ids))
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
@@ -906,28 +937,12 @@ class vLLMHttpServer:
             dict[str, Any]: Dictionary containing abort result.
         """
         try:
-            request_states = self.engine.output_processor.request_states
-            req_state = request_states.get(request_id)
+            if not self.engine.output_processor.external_req_ids.get(request_id):
+                return {"aborted": False, "request_id": request_id}
 
-            if req_state is None:
-                return {"aborted": False, "error": f"Request {request_id} not found"}
-
-            # Create abort output and put it to the queue
-            from vllm.v1.engine import FinishReason
-
-            request_output = req_state.make_request_output(
-                [], pooling_output=None, finish_reason=FinishReason.ABORT, stop_reason=None
-            )
-            req_state.queue.put(request_output)
-
-            # Abort in output processor and engine core
-            self.engine.output_processor.abort_requests([request_id])
-            await self.engine.engine_core.abort_requests_async([request_id])
-
-            # Try to reset prefix cache to ensure clean state
+            await self.engine.abort(request_id, internal=False)
             if reset_prefix_cache:
                 await self.clear_kv_cache()
-                logger.info(f"Prefix cache reset after abort request {request_id}")
 
             logger.info(f"Aborted request: {request_id}")
             return {"aborted": True, "request_id": request_id}

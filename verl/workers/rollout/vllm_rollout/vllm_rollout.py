@@ -85,6 +85,9 @@ class ServerAdapter(BaseRollout):
             self.replica_rank = replica_rank
         self.rollout_rank = rank % rollout_world_size
         self.node_rank = self.rollout_rank // local_world_size
+        suffix = (self.config.custom or {}).get("server_name_suffix", "")
+        self.server_name_suffix = f"_{suffix}" if suffix else ""
+        self.replica_namespace = f"-{suffix}" if suffix else ""
 
         # Map each trainer rank to its co-located vLLM server so weight-update
         # IPC handles stay on the GPU where they were created. Offset math
@@ -138,7 +141,10 @@ class ServerAdapter(BaseRollout):
         # stale socket file) cannot collide on the shared /tmp namespace.
         local_rank = self.rollout_rank % local_world_size
         job_id = ray.get_runtime_context().get_job_id()
-        self.zmq_handle = f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self.replica_rank}-rank-{local_rank}.sock"
+        self.zmq_handle = (
+            f"ipc:///tmp/rl-colocate-zmq-{job_id}{self.replica_namespace}"
+            f"-replica-{self.replica_rank}-rank-{local_rank}.sock"
+        )
 
         self.use_shm = not is_support_ipc()
         if self.use_shm:
@@ -157,11 +163,13 @@ class ServerAdapter(BaseRollout):
         if self.server_handle is None:
             prefix = self._get_server_name_prefix()
             if self._pd_role == "prefill":
-                actor_name = f"{prefix}server_{self.replica_rank}_0"
+                actor_name = f"{prefix}server_{self.replica_rank}_0{self.server_name_suffix}"
             elif self._pd_role == "decode":
-                actor_name = f"{prefix}server_decode_{self.replica_rank}_{self._pd_server_index}"
+                actor_name = (
+                    f"{prefix}server_decode_{self.replica_rank}_{self._pd_server_index}{self.server_name_suffix}"
+                )
             else:
-                actor_name = f"{prefix}server_{self.replica_rank}_{self.node_rank}"
+                actor_name = f"{prefix}server_{self.replica_rank}_{self.node_rank}{self.server_name_suffix}"
             self.server_handle = ray.get_actor(actor_name)
         return True
 

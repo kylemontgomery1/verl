@@ -217,6 +217,7 @@ class LLMServerClient:
         """
         self.config = config
         self._load_balancer = load_balancer_handle
+        self._supports_request_abort = False
 
     async def _acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         # Atomic acquire: returns (server_id, handle) in one Ray RPC.
@@ -227,6 +228,37 @@ class LLMServerClient:
         # Fire-and-forget: release is just a counter decrement, no need to await.
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         self._load_balancer.release_server.remote(server_id=server_id)
+
+    @staticmethod
+    def _request_finished(request_ref) -> bool:
+        try:
+            ready, _ = ray.wait([request_ref], timeout=0)
+        except Exception:
+            return False
+        return bool(ready)
+
+    async def _abort_backend_request(self, server, request_ref, backend_request_id: str) -> bool:
+        try:
+            result = await asyncio.wait_for(
+                server.abort_request.remote(
+                    request_id=backend_request_id,
+                    reset_prefix_cache=False,
+                ),
+                timeout=1.0,
+            )
+        except Exception as exc:
+            logger.warning("Failed to abort generation request %s: %s", backend_request_id, exc)
+            result = {"aborted": False}
+
+        if result.get("aborted", False) or self._request_finished(request_ref):
+            return True
+
+        try:
+            ray.cancel(request_ref, force=False)
+        except Exception as exc:
+            logger.warning("Failed to cancel Ray request %s: %s", backend_request_id, exc)
+            return False
+        return True
 
     def _vllm_request_id(self, request_id: str) -> str:
         # request_id passed to vLLM. Default: a fresh uuid per turn so each turn
@@ -271,8 +303,9 @@ class LLMServerClient:
             priority_kwargs = (
                 {"priority": priority} if priority != 0 and self.config.actor_rollout_ref.rollout.name == "vllm" else {}
             )
-            output: TokenOutput = await server.generate.remote(
-                request_id=self._vllm_request_id(request_id),  # use new request_id for each turn
+            backend_request_id = self._vllm_request_id(request_id)
+            request_ref = server.generate.remote(
+                request_id=backend_request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
                 image_data=image_data,
@@ -281,6 +314,12 @@ class LLMServerClient:
                 **priority_kwargs,
                 **kwargs,
             )
+            try:
+                output: TokenOutput = await request_ref
+            except asyncio.CancelledError:
+                if self._supports_request_abort:
+                    await self._abort_backend_request(server, request_ref, backend_request_id)
+                raise
             global_steps = output.extra_fields.get("global_steps")
             output.extra_fields.setdefault("min_global_steps", global_steps)
             output.extra_fields.setdefault("max_global_steps", global_steps)
@@ -488,10 +527,12 @@ class LLMServerManager:
         rollout_resource_pool: RayResourcePool = None,
         start_rank: int = 0,
         load_balancer_cls: type | None = None,
+        rollout_config: DictConfig = None,
+        model_config: DictConfig = None,
     ):
         self.config = config
-        self.rollout_config = config.actor_rollout_ref.rollout
-        self.model_config = config.actor_rollout_ref.model
+        self.rollout_config = rollout_config if rollout_config is not None else config.actor_rollout_ref.rollout
+        self.model_config = model_config if model_config is not None else config.actor_rollout_ref.model
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.start_rank = start_rank
@@ -553,12 +594,19 @@ class LLMServerManager:
         )
         num_replicas = world_size // rollout_world_size
 
+        replica_kwargs = {}
+        server_name_suffix = (self.rollout_config.get("custom") or {}).get("server_name_suffix", "")
+        if server_name_suffix:
+            if self.rollout_config.name != "vllm":
+                raise NotImplementedError("rollout.custom.server_name_suffix is supported only for vLLM")
+            replica_kwargs["name_suffix"] = server_name_suffix
         self.rollout_replicas = [
             self.rollout_replica_class(
                 replica_rank=start_rank + replica_rank,
                 config=self.rollout_config,
                 model_config=self.model_config,
                 gpus_per_node=self.rollout_config.n_gpus_per_node,
+                **replica_kwargs,
             )
             for replica_rank in range(num_replicas)
         ]
@@ -622,11 +670,13 @@ class LLMServerManager:
             **kwargs: Forwarded to the client constructor.
         """
         client_cls = client_cls or LLMServerClient
-        return client_cls(
+        client = client_cls(
             config=self.config,
             load_balancer_handle=self.global_load_balancer,
             **kwargs,
         )
+        client._supports_request_abort = self.rollout_config.name == "vllm"
+        return client
 
     def get_addresses(self) -> list[str]:
         """Get the OpenAI chat completion API http addresses of the LLM server replicas."""

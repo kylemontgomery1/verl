@@ -608,6 +608,39 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     return metrics
 
 
+def compute_agent_loop_metrics(
+    batch: DataProto,
+    key: str = "agent_metrics",
+    prefix: str = "agent",
+) -> dict[str, float]:
+    """Aggregate per-trajectory agent metrics while ignoring missing values."""
+    per_sample = batch.non_tensor_batch.get(key)
+    if per_sample is None:
+        return {}
+
+    buckets: dict[str, list[float]] = defaultdict(list)
+    for sample in per_sample:
+        if not sample:
+            continue
+        for name, value in sample.items():
+            buckets[name].append(float(value))
+
+    metrics: dict[str, float] = {}
+    for name, values in buckets.items():
+        array = np.asarray(values, dtype=np.float64)
+        array = array[~np.isnan(array)]
+        if array.size == 0:
+            continue
+        if name.endswith("/min"):
+            reduced = float(np.min(array))
+        elif name.endswith("/max"):
+            reduced = float(np.max(array))
+        else:
+            reduced = float(np.mean(array))
+        metrics[f"{prefix}/{name}"] = reduced
+    return metrics
+
+
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
     """
     Computes timing metrics for different processing stages in PPO training.

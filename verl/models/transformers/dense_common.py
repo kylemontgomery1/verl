@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
+from torch.distributed.tensor import DTensor
 from transformers.cache_utils import Cache
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -120,9 +121,13 @@ def forward_with_torch_backend(
         raise RuntimeError("To use forward_with_torch_backend, either labels or input_ids must be provided.")
 
     fused_linear_for_ppo = FusedLinearForPPO()
+    vocab_weights = self.lm_head.weight
+    if isinstance(vocab_weights, DTensor):
+        vocab_weights = vocab_weights.full_tensor()
+    hidden_states = hidden_states.to(vocab_weights.dtype)
     log_probs, entropy = fused_linear_for_ppo.forward(
         hidden_states=hidden_states,
-        vocab_weights=self.lm_head.weight,
+        vocab_weights=vocab_weights,
         input_ids=rolled_labels,
         temperature=temperature,
     )

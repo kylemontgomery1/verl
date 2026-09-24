@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+import gzip
 import json
 import logging
 import math
 import os
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -52,6 +55,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     RolloutMoELoadBalanceMetricsAccumulator,
+    compute_agent_loop_metrics,
     compute_data_metrics,
     compute_moe_lb_metrics,
     compute_throughout_metrics,
@@ -69,6 +73,7 @@ from verl.trainer.ppo.utils import (
     create_rl_sampler,
     need_critic,
     need_reference_policy,
+    need_separated_world_model,
     need_teacher_policy,
 )
 from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY, ReplayBuffer, ReplayBufferAsync
@@ -88,7 +93,7 @@ from verl.utils.tracking import DapoFilteredRewardTableLogger, Tracking, Validat
 from verl.workers.config import CriticConfig, DistillationConfig, HFModelConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
-from verl.workers.utils.losses import value_loss
+from verl.workers.utils.losses import value_loss, world_model_ce_loss
 from verl.workers.utils.padding import response_from_nested, response_to_nested
 
 
@@ -126,11 +131,14 @@ class PPOTrainer(ABC):
         self.config = config
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
+        self.use_separated_world_model = need_separated_world_model(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
         if self.config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.trainer_mode = self.config.trainer.v1.trainer_mode
+        if self.use_separated_world_model and self.trainer_mode != "sync":
+            raise NotImplementedError("world_model_actor currently supports only trainer.v1.trainer_mode=sync")
         self.parameter_sync_step = self.config.trainer.v1.get(self.trainer_mode, {}).get("parameter_sync_step", 1)
         self.replay_buffer = self._build_replay_buffer()
         self._rollout_moe_lb_metrics_accumulator = RolloutMoELoadBalanceMetricsAccumulator(
@@ -245,6 +253,16 @@ class PPOTrainer(ABC):
         )
         self.resource_pool_to_cls[actor_rollout_resource_pool][str(actor_role)] = actor_rollout_cls
 
+        world_model_resource_pool = None
+        if self.use_separated_world_model:
+            world_model_resource_pool = self.resource_pool_manager.get_resource_pool(Role.WorldModel)
+            world_model_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.WorldModel],
+                config=self.config.world_model_actor,
+                role=str(Role.ActorRollout),
+            )
+            self.resource_pool_to_cls[world_model_resource_pool][str(Role.WorldModel)] = world_model_cls
+
         # 2. define critic class
         if self.use_critic:
             critic_cfg: CriticConfig = omega_conf_to_dataclass(self.config.critic)
@@ -313,6 +331,15 @@ class PPOTrainer(ABC):
         self.actor_rollout_wg.init_model()
         logger.info("actor and ref model engine initialized")
 
+        if self.use_separated_world_model:
+            self._check_world_model_vocab()
+            self.world_model_wg = all_wg[str(Role.WorldModel)]
+            self.world_model_wg.init_model()
+            world_model_actor_config = omega_conf_to_dataclass(self.config.world_model_actor.actor)
+            world_model_loss = partial(world_model_ce_loss, config=world_model_actor_config)
+            self.world_model_wg.set_loss_fn(world_model_loss)
+            logger.info("world-model engine initialized")
+
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = self.config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
         if lora_rank <= 0:
@@ -351,6 +378,16 @@ class PPOTrainer(ABC):
         self.llm_server_manager: LLMServerManager = LLMServerManager.create(
             config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
         )
+        if self.use_separated_world_model:
+            self.wm_server_manager: LLMServerManager = LLMServerManager.create(
+                config=self.config,
+                worker_group=self.world_model_wg,
+                rollout_resource_pool=world_model_resource_pool,
+                rollout_config=self.config.world_model_actor.rollout,
+                model_config=self.config.world_model_actor.model,
+            )
+        else:
+            self.wm_server_manager = None
 
         # 10. initialize checkpoint engine manager
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
@@ -360,10 +397,24 @@ class PPOTrainer(ABC):
             actor_wg=self.actor_rollout_wg,
             replicas=self.llm_server_manager.get_replicas(),
         )
+        if self.use_separated_world_model:
+            world_model_checkpoint_config = omega_conf_to_dataclass(
+                self.config.world_model_actor.rollout.checkpoint_engine
+            )
+            world_model_checkpoint_config.backend = "naive"
+            self.wm_checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
+                config=world_model_checkpoint_config,
+                actor_wg=self.world_model_wg,
+                replicas=self.wm_server_manager.get_replicas(),
+            )
+        else:
+            self.wm_checkpoint_manager = None
         logger.info("checkpoint engine manager initialized")
 
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
+        if self.use_separated_world_model:
+            self.wm_checkpoint_manager.sleep_replicas()
         self._load_checkpoint()
 
         logger.info("all initialize finished, ready to fit")
@@ -371,6 +422,10 @@ class PPOTrainer(ABC):
     def get_llm_client(self) -> LLMServerClient:
         """Get the LLM server client for rollout generation."""
         return self.llm_server_manager.get_client()
+
+    def get_wm_client(self) -> LLMServerClient | None:
+        """Get the separate world-model inference client."""
+        return self.wm_server_manager.get_client() if self.use_separated_world_model else None
 
     def get_teacher_client(self) -> Optional[dict[str, LLMServerClient]]:
         """Get the On-Policy Distillation teacher server clients.
@@ -547,6 +602,11 @@ class PPOTrainer(ABC):
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
 
+        rollout_batch_data_dir = self.config.trainer.get("rollout_batch_data_dir", None)
+        if rollout_batch_data_dir:
+            with marked_timer("dump_rollout_batch", timing_raw, color="green"):
+                self._dump_rollout_batch(batch, rollout_batch_data_dir)
+
         # 2. [OPTIONAL] compute reward score with colocated reward model
         if self.reward_loop_manager.reward_loop_worker_handles is None:
             with marked_timer("reward", timing_raw, color="yellow"):
@@ -581,7 +641,19 @@ class PPOTrainer(ABC):
         # 9. update actor
         if self.config.trainer.critic_warmup <= self.global_steps:
             with marked_timer("update_actor", timing_raw, color="red"):
-                batch = self._update_actor(batch, metrics=metrics)
+                if self.use_separated_world_model:
+                    world_model_metrics = {}
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        world_model_future = executor.submit(
+                            self._update_world_model,
+                            batch,
+                            world_model_metrics,
+                        )
+                        batch = self._update_actor(batch, metrics=metrics)
+                        world_model_future.result()
+                    metrics.update(world_model_metrics)
+                else:
+                    batch = self._update_actor(batch, metrics=metrics)
 
         return batch
 
@@ -649,6 +721,11 @@ class PPOTrainer(ABC):
         self.tokenizer = model_config.tokenizer
         # Used for multimodal LLM, could be None
         self.processor = model_config.processor
+
+    def _check_world_model_vocab(self):
+        world_model_config: HFModelConfig = omega_conf_to_dataclass(self.config.world_model_actor.model)
+        if world_model_config.tokenizer.get_vocab() != self.tokenizer.get_vocab():
+            raise ValueError("world_model_actor and actor_rollout_ref must use identical token vocabularies")
 
     def _init_dataloader(self):
         """Initialize train and validate dataloader."""
@@ -725,6 +802,8 @@ class PPOTrainer(ABC):
             with open_dict(self.config):
                 if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
                     self.config.actor_rollout_ref.actor.optim.total_training_steps = optim_total_training_steps
+                if self.use_separated_world_model and OmegaConf.select(self.config, "world_model_actor.actor.optim"):
+                    self.config.world_model_actor.actor.optim.total_training_steps = optim_total_training_steps
                 if OmegaConf.select(self.config, "critic.optim"):
                     self.config.critic.optim.total_training_steps = optim_total_training_steps
         except Exception as e:
@@ -747,6 +826,10 @@ class PPOTrainer(ABC):
         self.role_worker_mapping[role] = ray.remote(ActorRolloutRefWorker)
         self.mapping[role] = "global_pool"
 
+        if self.use_separated_world_model:
+            self.role_worker_mapping[Role.WorldModel] = ray.remote(ActorRolloutRefWorker)
+            self.mapping[Role.WorldModel] = "world_model_pool"
+
         # Add critic worker to mapping.
         if need_critic(config):
             self.role_worker_mapping[Role.Critic] = ray.remote(TrainingWorker)
@@ -757,7 +840,15 @@ class PPOTrainer(ABC):
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
-
+        if self.use_separated_world_model:
+            world_model_resource = config.world_model_actor.resource
+            if world_model_resource.n_gpus_per_node <= 0:
+                raise ValueError("world_model_actor.resource.n_gpus_per_node must be greater than 0")
+            if world_model_resource.nnodes <= 0:
+                raise ValueError("world_model_actor.resource.nnodes must be greater than 0")
+            resource_pool_spec["world_model_pool"] = [
+                world_model_resource.n_gpus_per_node
+            ] * world_model_resource.nnodes
         # Add separate resource pool for reward model if enabled
         if config.reward.reward_model.enable_resource_pool:
             if config.reward.reward_model.n_gpus_per_node <= 0:
@@ -820,6 +911,12 @@ class PPOTrainer(ABC):
             local_path=os.path.join(global_step_folder, "actor"),
             del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
         )
+
+        if self.use_separated_world_model:
+            self.world_model_wg.load_checkpoint(
+                local_path=os.path.join(global_step_folder, str(Role.WorldModel)),
+                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+            )
 
         # 3. load critic checkpoint
         if self.use_critic:
@@ -916,6 +1013,24 @@ class PPOTrainer(ABC):
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
         )
 
+        if self.use_separated_world_model:
+            world_model_local_path = os.path.join(local_global_step_folder, str(Role.WorldModel))
+            world_model_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(
+                    self.config.trainer.default_hdfs_dir,
+                    f"global_step_{self.global_steps}",
+                    str(Role.WorldModel),
+                )
+            )
+            self.world_model_wg.save_checkpoint(
+                world_model_local_path,
+                world_model_remote_path,
+                self.global_steps,
+                max_ckpt_to_keep=max_actor_ckpt_to_keep,
+            )
+
         # save critic
         if self.use_critic:
             critic_local_path = os.path.join(local_global_step_folder, str(Role.Critic))
@@ -956,7 +1071,318 @@ class PPOTrainer(ABC):
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+    def _validate_async_rollout_eval(self) -> dict[str, float]:
+        config = self.config.trainer.async_rollout_eval
+        max_inflight_rollouts = int(config.get("max_inflight_rollouts", 256))
+        rollouts_per_group = int(config.get("rollouts_per_group", 16))
+        prompt_groups_per_batch = int(config.get("prompt_groups_per_batch", 16))
+        poll_interval_sec = float(config.get("poll_interval_sec", 0.05))
+        report_level = str(self.config.trainer.get("eval_report_level", "basic"))
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+
+        if report_level not in {"basic", "detailed"}:
+            raise ValueError("Async rollout evaluation requires trainer.eval_report_level=basic or detailed")
+        if not val_data_dir:
+            raise ValueError("trainer.validation_data_dir is required for async rollout evaluation")
+        if self.config.actor_rollout_ref.rollout.val_kwargs.n != 1:
+            raise ValueError("Async rollout evaluation requires actor_rollout_ref.rollout.val_kwargs.n=1")
+        if self.config.data.val_batch_size != 1:
+            raise ValueError("Async rollout evaluation requires data.val_batch_size=1")
+        if max_inflight_rollouts <= 0 or rollouts_per_group <= 0 or prompt_groups_per_batch <= 0:
+            raise ValueError("Async rollout evaluation sizes must be positive")
+        if max_inflight_rollouts % rollouts_per_group != 0:
+            raise ValueError("max_inflight_rollouts must be divisible by rollouts_per_group")
+        if self.reward_loop_manager.reward_loop_worker_handles is None:
+            raise NotImplementedError("Async rollout evaluation requires non-colocated reward workers")
+
+        total_rollouts = len(self.val_dataset)
+        if total_rollouts == 0 or total_rollouts % rollouts_per_group != 0:
+            raise ValueError("Async rollout evaluation data must contain complete prompt groups")
+        if total_rollouts < max_inflight_rollouts:
+            raise ValueError("Async rollout evaluation data is smaller than max_inflight_rollouts")
+
+        os.makedirs(val_data_dir, exist_ok=True)
+        rollout_path = os.path.join(val_data_dir, "rollouts.jsonl")
+        group_path = os.path.join(val_data_dir, "prompt_groups.jsonl")
+        batch_path = os.path.join(val_data_dir, "batches.jsonl")
+        summary_path = os.path.join(val_data_dir, "summary.json")
+
+        def json_encode_default(obj):
+            if isinstance(obj, np.generic):
+                return obj.item()
+            if isinstance(obj, torch.Tensor):
+                return obj.tolist()
+            if hasattr(obj, "tolist"):
+                return obj.tolist()
+            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+        def first_value(values):
+            if isinstance(values, torch.Tensor):
+                value = values[0]
+                return value.item() if value.numel() == 1 else value
+            value = list(values)[0]
+            return getattr(value, "data", value)
+
+        val_iterator = iter(self.val_dataloader)
+        loaded_rollouts = 0
+
+        def next_rollout() -> TensorDict:
+            nonlocal loaded_rollouts
+            try:
+                batch_dict = next(val_iterator)
+            except StopIteration as exc:
+                raise RuntimeError(
+                    f"Async rollout evaluation ended after {loaded_rollouts} of {total_rollouts} rows"
+                ) from exc
+            if len(batch_dict["raw_prompt"]) != 1:
+                raise ValueError("Async rollout evaluation dataloader must yield one row at a time")
+
+            extra_info = batch_dict["extra_info"][0]
+            expected_group = loaded_rollouts // rollouts_per_group
+            expected_rollout = loaded_rollouts % rollouts_per_group
+            expected_job = loaded_rollouts
+            actual = (
+                int(extra_info.get("async_group_id", -1)),
+                int(extra_info.get("async_rollout_index", -1)),
+                int(extra_info.get("async_job_index", -1)),
+            )
+            expected = (expected_group, expected_rollout, expected_job)
+            if actual != expected:
+                raise ValueError(f"Invalid async rollout ordering at row {loaded_rollouts}: {actual} != {expected}")
+
+            batch_dict["uid"] = np.array([str(uuid.uuid4())], dtype=object)
+            rollout = tu.get_tensordict(batch_dict)
+            tu.assign_non_tensor_data(rollout, "global_steps", self.global_steps)
+            tu.assign_non_tensor_data(rollout, "validate", True)
+            loaded_rollouts += 1
+            return rollout
+
+        def submit_rollouts(rollouts: list[TensorDict]) -> None:
+            batch = rollouts[0] if len(rollouts) == 1 else tu.concat_tensordict(rollouts)
+            uids = [str(uid) for uid in batch["uid"]]
+            tags = [
+                {"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))
+            ]
+            tq.kv_batch_put(keys=uids, partition_id="val", tags=tags)
+            self.agent_loop_manager.generate_sequences_round_robin(batch)
+
+        sample_uids = []
+        sample_scores = []
+        sample_turns = []
+        data_sources = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        rollout_wall_secs = []
+        agent_secs = []
+        completed_job_indices = set()
+        group_states: dict[int, dict] = {}
+        group_rows = []
+        batch_rows = []
+        completed_rollouts = 0
+        submitted_rollouts = 0
+        previous_batch_ready_sec = 0.0
+
+        self.replay_buffer.poll_interval = poll_interval_sec
+        benchmark_started_at = time.monotonic()
+
+        initial_group_count = max_inflight_rollouts // rollouts_per_group
+        for _ in range(initial_group_count):
+            initial_group = [next_rollout() for _ in range(rollouts_per_group)]
+            submit_rollouts(initial_group)
+            submitted_rollouts += len(initial_group)
+
+        with open(rollout_path, "w") as rollout_file:
+            while completed_rollouts < total_rollouts:
+                completed_batch, _ = self.replay_buffer.sample(
+                    global_steps=self.global_steps,
+                    partition_id="val",
+                    batch_size=1,
+                )
+                completion_sec = time.monotonic() - benchmark_started_at
+                if not completed_batch.keys:
+                    raise RuntimeError("Async rollout evaluation received a completed row without trajectory data")
+
+                if loaded_rollouts < total_rollouts:
+                    submit_rollouts([next_rollout()])
+                    submitted_rollouts += 1
+                if submitted_rollouts - completed_rollouts - 1 > max_inflight_rollouts:
+                    raise RuntimeError("Async rollout scheduler exceeded its in-flight limit")
+
+                final_key = max(
+                    completed_batch.keys,
+                    key=lambda key: int(key.rsplit("_", 2)[-1]) if len(key.rsplit("_", 2)) == 3 else 0,
+                )
+                fields = [
+                    "uid",
+                    "rm_scores",
+                    "num_turns",
+                    "data_source",
+                    "extra_fields",
+                    "extra_info",
+                    "metrics",
+                ]
+                data = tq.kv_batch_get(keys=[final_key], partition_id="val", select_fields=fields)
+                try:
+                    output_uid = str(first_value(data["uid"]))
+                    score = float(data["rm_scores"].sum(dim=1).tolist()[0])
+                    num_turns = int(first_value(data["num_turns"]))
+                    data_source = str(first_value(data["data_source"]))
+                    extra_fields = first_value(data["extra_fields"]) or {}
+                    extra_info = first_value(data["extra_info"])
+                    agent_loop_metrics = first_value(data["metrics"])
+
+                    group_id = int(extra_info["async_group_id"])
+                    rollout_index = int(extra_info["async_rollout_index"])
+                    job_index = int(extra_info["async_job_index"])
+                    task_id = str(extra_info["id"])
+                    if job_index in completed_job_indices:
+                        raise RuntimeError(f"Async rollout job {job_index} completed more than once")
+                    completed_job_indices.add(job_index)
+
+                    rollout_wall_sec = extra_fields.get("rollout_wall_sec")
+                    agent_metrics = extra_fields.get("agent_metrics", {})
+                    if rollout_wall_sec is not None:
+                        rollout_wall_secs.append(float(rollout_wall_sec))
+                    if agent_metrics.get("agent_sec/mean") is not None:
+                        agent_secs.append(float(agent_metrics["agent_sec/mean"]))
+
+                    rollout_row = {
+                        "uid": output_uid,
+                        "task_id": task_id,
+                        "group_id": group_id,
+                        "rollout_index": rollout_index,
+                        "job_index": job_index,
+                        "completion_sec": completion_sec,
+                        "reward": score,
+                        "rollout_wall_sec": rollout_wall_sec,
+                        "agent_loop_metrics": agent_loop_metrics,
+                        "agent_metrics": agent_metrics,
+                    }
+                    if report_level == "detailed":
+                        rollout_row["agent_trace"] = extra_fields.get("agent_trace")
+                    rollout_file.write(json.dumps(rollout_row, ensure_ascii=False, default=json_encode_default) + "\n")
+
+                    sample_uids.append(f"async-group-{group_id}")
+                    sample_scores.append(score)
+                    sample_turns.append(num_turns)
+                    data_sources.append(data_source)
+                    reward_extra_info = extra_fields.get("reward_extra_info", {})
+                    for key in reward_extra_infos_dict:
+                        if key != "reward" and key not in reward_extra_info:
+                            reward_extra_infos_dict[key].append(None)
+                    for key, value in reward_extra_info.items():
+                        if key == "reward":
+                            continue
+                        if key not in reward_extra_infos_dict:
+                            reward_extra_infos_dict[key] = [None] * completed_rollouts
+                        reward_extra_infos_dict[key].append(value)
+                    reward_extra_infos_dict["reward"].append(score)
+
+                    state = group_states.setdefault(
+                        group_id,
+                        {
+                            "task_id": task_id,
+                            "rollout_indices": set(),
+                            "reward_total": 0.0,
+                        },
+                    )
+                    if state["task_id"] != task_id:
+                        raise RuntimeError(f"Async rollout group {group_id} contains multiple task IDs")
+                    if rollout_index in state["rollout_indices"]:
+                        raise RuntimeError(f"Async rollout group {group_id} repeated rollout {rollout_index}")
+                    state["rollout_indices"].add(rollout_index)
+                    state["reward_total"] += score
+
+                    if len(state["rollout_indices"]) == rollouts_per_group:
+                        group_row = {
+                            "completion_rank": len(group_rows),
+                            "group_id": group_id,
+                            "task_id": task_id,
+                            "completion_sec": completion_sec,
+                            "mean_reward": state["reward_total"] / rollouts_per_group,
+                        }
+                        group_rows.append(group_row)
+                        if len(group_rows) % prompt_groups_per_batch == 0:
+                            wall_clock_sec = completion_sec - previous_batch_ready_sec
+                            batch_rows.append(
+                                {
+                                    "batch_index": len(batch_rows),
+                                    "ready_sec": completion_sec,
+                                    "wall_clock_sec": wall_clock_sec,
+                                    "num_prompts": prompt_groups_per_batch,
+                                    "num_rollouts": prompt_groups_per_batch * rollouts_per_group,
+                                }
+                            )
+                            previous_batch_ready_sec = completion_sec
+                finally:
+                    tq.kv_clear(keys=completed_batch.keys, partition_id="val")
+
+                completed_rollouts += 1
+                if completed_rollouts % 256 == 0:
+                    rollout_file.flush()
+                    logger.info(
+                        "Async rollout evaluation completed %s/%s rows and %s prompt groups",
+                        completed_rollouts,
+                        total_rollouts,
+                        len(group_rows),
+                    )
+
+        total_wall_sec = time.monotonic() - benchmark_started_at
+        expected_groups = total_rollouts // rollouts_per_group
+        if len(group_rows) != expected_groups:
+            raise RuntimeError(f"Completed {len(group_rows)} of {expected_groups} prompt groups")
+
+        with open(group_path, "w") as file:
+            for row in group_rows:
+                file.write(json.dumps(row) + "\n")
+        with open(batch_path, "w") as file:
+            for row in batch_rows:
+                file.write(json.dumps(row) + "\n")
+
+        batch_wall_secs = [row["wall_clock_sec"] for row in batch_rows]
+        steady_batch_wall_secs = batch_wall_secs[1:-1] if len(batch_wall_secs) > 2 else batch_wall_secs
+        mean_batch_wall_sec = float(np.mean(batch_wall_secs))
+        steady_mean_batch_wall_sec = float(np.mean(steady_batch_wall_secs))
+        summary = {
+            "report_level": report_level,
+            "mode": "async_rollout_eval",
+            "max_inflight_rollouts": max_inflight_rollouts,
+            "rollouts_per_group": rollouts_per_group,
+            "prompt_groups_per_batch": prompt_groups_per_batch,
+            "num_rollouts": completed_rollouts,
+            "num_prompt_groups": len(group_rows),
+            "num_batches": len(batch_rows),
+            "total_wall_sec": total_wall_sec,
+            "mean_batch_wall_sec": mean_batch_wall_sec,
+            "steady_state_mean_batch_wall_sec": steady_mean_batch_wall_sec,
+            "rollouts_per_hour": completed_rollouts * 3600.0 / total_wall_sec,
+            "steady_state_rollouts_per_hour": (
+                prompt_groups_per_batch * rollouts_per_group * 3600.0 / steady_mean_batch_wall_sec
+            ),
+            "mean_rollout_wall_sec": float(np.mean(rollout_wall_secs)) if rollout_wall_secs else None,
+            "mean_agent_sec": float(np.mean(agent_secs)) if agent_secs else None,
+            "mean_reward": float(np.mean(sample_scores)),
+        }
+        with open(summary_path, "w") as file:
+            json.dump(summary, file, indent=2)
+            file.write("\n")
+
+        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metric_dict.update({f"eval/{key}": value for key, value in summary.items() if isinstance(value, int | float)})
+        return metric_dict
+
     def _validate(self) -> dict[str, float]:
+        async_eval_config = self.config.trainer.get("async_rollout_eval", None)
+        if async_eval_config is not None and bool(async_eval_config.get("enabled", False)):
+            return self._validate_async_rollout_eval()
+
+        report_level = str(self.config.trainer.get("eval_report_level", "off"))
+        if report_level not in {"off", "basic", "detailed"}:
+            raise ValueError(f"Unknown trainer.eval_report_level: {report_level}")
+        report_eval = report_level != "off"
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if report_eval and not val_data_dir:
+            raise ValueError("trainer.validation_data_dir is required when eval reporting is enabled")
+
         # Lists to collect samples for the table
         sample_uids = []
         sample_inputs = []
@@ -964,12 +1390,16 @@ class PPOTrainer(ABC):
         sample_gts = []
         sample_scores = []
         sample_turns = []
+        sample_agent_loop_metrics = []
+        sample_extra_fields = []
+        sample_extra_infos = []
         data_sources = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
         dump_all_inputs: list[str] = []
         dump_all_outputs: list[str] = []
         dump_all_keys: list[str] = []
         session_to_sample_idx: dict[str, int] = {}
+        batch_rows = []
 
         for batch_dict in self.val_dataloader:
             # 1. put batch to agent loop manager
@@ -985,12 +1415,15 @@ class PPOTrainer(ABC):
                 {"is_prompt": True, "status": "pending", "global_steps": self.global_steps} for _ in range(len(batch))
             ]
             tq.kv_batch_put(keys=list(batch["uid"]), partition_id="val", tags=tags)
+            batch_started_at = time.monotonic() if report_eval else None
+            submitted_prompt_count = len(batch)
             self.agent_loop_manager.generate_sequences(batch)
 
             # 2. sample batch from replay buffer: one prompt (GRPO group) per submitted row.
             batch, _ = self.replay_buffer.sample(
                 global_steps=self.global_steps, partition_id="val", batch_size=len(batch)
             )
+            batch_wall_sec = time.monotonic() - batch_started_at if batch_started_at is not None else None
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
             if self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -1028,9 +1461,12 @@ class PPOTrainer(ABC):
             all_outputs = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in text_data["responses"]]
 
             fields = ["uid", "rm_scores", "num_turns", "reward_model", "data_source", "extra_fields"]
+            if report_eval:
+                fields.extend(["metrics", "extra_info"])
             data = tq.kv_batch_get(keys=final_keys, partition_id=batch.partition_id, select_fields=fields)
 
-            sample_uids.extend(data.pop("uid").tolist())
+            output_uids = data.pop("uid").tolist()
+            sample_uids.extend(output_uids)
             sample_outputs.extend(all_outputs[i] for i in final_indices)
             sample_inputs.extend(all_inputs[i] for i in final_indices)
             scores = data["rm_scores"].sum(dim=1).tolist()
@@ -1039,9 +1475,45 @@ class PPOTrainer(ABC):
             reward_extra_infos_dict["reward"].extend(scores)
 
             extra_fields_list = data.pop("extra_fields", None)
+            extra_fields = extra_fields_list.tolist() if extra_fields_list is not None else [{}] * len(scores)
+            if report_eval:
+                agent_loop_metrics = data.pop("metrics").tolist()
+                extra_infos = data.pop("extra_info").tolist()
+                if report_level == "detailed":
+                    rollout_counts: dict[str, int] = defaultdict(int)
+                    detail_rows = []
+                    for uid, score, extra_field, extra_info in zip(
+                        output_uids, scores, extra_fields, extra_infos, strict=True
+                    ):
+                        uid = str(uid)
+                        rollout_index = rollout_counts[uid]
+                        rollout_counts[uid] += 1
+                        detail_rows.append(
+                            {
+                                "uid": uid,
+                                "task_id": extra_info.get("id"),
+                                "batch_index": extra_info.get("eval_batch_index"),
+                                "prompt_index": extra_info.get("eval_prompt_index"),
+                                "rollout_index": rollout_index,
+                                "score": score,
+                                "agent_trace": extra_field.pop("agent_trace", None),
+                            }
+                        )
+                    self._write_detailed_eval_batch(detail_rows, val_data_dir, len(batch_rows))
+                sample_extra_fields.extend(extra_fields)
+                sample_agent_loop_metrics.extend(agent_loop_metrics)
+                sample_extra_infos.extend(extra_infos)
+                batch_rows.append(
+                    {
+                        "batch_index": len(batch_rows),
+                        "wall_clock_sec": batch_wall_sec,
+                        "num_prompts": submitted_prompt_count,
+                        "num_rollouts": len(scores),
+                    }
+                )
             if extra_fields_list is not None:
-                n_prior = len(reward_extra_infos_dict["reward"]) - len(extra_fields_list.tolist())
-                for extra_field in extra_fields_list.tolist():
+                n_prior = len(reward_extra_infos_dict["reward"]) - len(extra_fields)
+                for extra_field in extra_fields:
                     reward_extra_info = (
                         extra_field.get("reward_extra_info", {}) if isinstance(extra_field, dict) else {}
                     )
@@ -1077,7 +1549,6 @@ class PPOTrainer(ABC):
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
         # dump to local dir
-        val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
             # Sort according to uid (so that generations in the same rollout are together)
             sort_keys = []
@@ -1097,6 +1568,28 @@ class PPOTrainer(ABC):
                 for parts in [key.rsplit("_", 2)]
             ]
             session_final_indices = [session_to_sample_idx[session] for session in dump_all_sessions]
+            report_fields = {"uid": dump_all_keys}
+            if report_eval:
+                rollout_indices = [
+                    int(parts[1]) if len(parts) == 3 else 0
+                    for key in dump_all_keys
+                    for parts in [key.rsplit("_", 2)]
+                ]
+                report_fields.update(
+                    {
+                        "task_id": [sample_extra_infos[i].get("id") for i in session_final_indices],
+                        "batch_index": [sample_extra_infos[i].get("eval_batch_index") for i in session_final_indices],
+                        "prompt_index": [sample_extra_infos[i].get("eval_prompt_index") for i in session_final_indices],
+                        "rollout_index": rollout_indices,
+                        "rollout_wall_sec": [
+                            sample_extra_fields[i].get("rollout_wall_sec") for i in session_final_indices
+                        ],
+                        "agent_loop_metrics": [sample_agent_loop_metrics[i] for i in session_final_indices],
+                        "agent_metrics": [
+                            sample_extra_fields[i].get("agent_metrics", {}) for i in session_final_indices
+                        ],
+                    }
+                )
             self._dump_generations(
                 inputs=dump_all_inputs,
                 outputs=dump_all_outputs,
@@ -1105,11 +1598,61 @@ class PPOTrainer(ABC):
                 reward_extra_infos_dict={
                     k: [v[i] for i in session_final_indices] for k, v in reward_extra_infos_dict.items()
                 }
-                | {"uid": dump_all_keys},
+                | report_fields,
                 dump_path=val_data_dir,
             )
 
-        return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        if report_eval:
+            rollout_wall_secs = [
+                item["rollout_wall_sec"] for item in sample_extra_fields if item.get("rollout_wall_sec") is not None
+            ]
+            summary = {
+                "report_level": report_level,
+                "num_batches": len(batch_rows),
+                "num_rollouts": len(rollout_wall_secs),
+                "mean_batch_wall_sec": float(np.mean([row["wall_clock_sec"] for row in batch_rows])),
+                "mean_rollout_wall_sec": float(np.mean(rollout_wall_secs)),
+            }
+            self._write_eval_summary(val_data_dir, batch_rows, summary)
+            metric_dict.update(
+                {f"eval/{key}": value for key, value in summary.items() if isinstance(value, int | float)}
+            )
+        return metric_dict
+
+    @staticmethod
+    def _write_detailed_eval_batch(rows: list[dict], data_dir: str, batch_index: int) -> None:
+        detail_dir = os.path.join(data_dir, "details")
+        os.makedirs(detail_dir, exist_ok=True)
+        path = os.path.join(detail_dir, f"batch_{batch_index:02d}.jsonl.gz")
+        temporary_path = f"{path}.tmp"
+
+        def json_encode_default(obj):
+            if isinstance(obj, np.generic):
+                return obj.item()
+            if hasattr(obj, "tolist"):
+                return obj.tolist()
+            raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+        with gzip.open(temporary_path, "wt", compresslevel=1) as file:
+            for row in rows:
+                file.write(json.dumps(row, ensure_ascii=False, default=json_encode_default) + "\n")
+        os.replace(temporary_path, path)
+
+    @staticmethod
+    def _write_eval_summary(data_dir: str, batch_rows: list[dict], summary: dict) -> None:
+        os.makedirs(data_dir, exist_ok=True)
+        for filename, content in (("batches.jsonl", batch_rows), ("summary.json", summary)):
+            path = os.path.join(data_dir, filename)
+            temporary_path = f"{path}.tmp"
+            with open(temporary_path, "w") as file:
+                if filename.endswith(".jsonl"):
+                    for row in content:
+                        file.write(json.dumps(row) + "\n")
+                else:
+                    json.dump(content, file, indent=2)
+                    file.write("\n")
+            os.replace(temporary_path, path)
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1189,6 +1732,73 @@ class PPOTrainer(ABC):
                 f.result()  # re-raises if the write failed
             else:
                 still_pending.append(f)
+        self._dump_futures = still_pending
+
+    @staticmethod
+    def _write_rollout_batch(
+        batch: DataProto,
+        dump_path: str,
+        global_steps: int,
+        trigger_step: int,
+        parameter_sync_step: int,
+    ):
+        os.makedirs(dump_path, exist_ok=True)
+        suffix = "" if parameter_sync_step == 1 else f"_{trigger_step:03d}"
+        filename = os.path.join(dump_path, f"step_{global_steps:06d}{suffix}.pkl")
+        temporary_filename = f"{filename}.tmp"
+        batch.save_to_disk(temporary_filename)
+        os.replace(temporary_filename, filename)
+        print(f"Dumped rollout batch to {filename}")
+
+    def _dump_rollout_batch(self, batch: KVBatchMeta, dump_path: str):
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id)
+        rollout_batch = DataProto.from_tensordict(data)
+        prompt_lengths = [tag["prompt_len"] for tag in batch.tags]
+        response_lengths = [tag["response_len"] for tag in batch.tags]
+        prompt_width = max(prompt_lengths)
+        response_width = max(response_lengths)
+        prompts = torch.full(
+            (len(batch), prompt_width),
+            self.tokenizer.pad_token_id,
+            dtype=rollout_batch.batch["prompts"].dtype,
+        )
+        responses = rollout_batch.batch["responses"].to_padded_tensor(
+            padding=self.tokenizer.pad_token_id,
+            output_size=(len(batch), response_width),
+        )
+        for index, prompt_length in enumerate(prompt_lengths):
+            prompts[index, -prompt_length:] = rollout_batch.batch["prompts"][index]
+        prompt_attention_mask = torch.zeros_like(prompts)
+        response_attention_mask = torch.zeros_like(responses)
+        for index, (prompt_length, response_length) in enumerate(zip(prompt_lengths, response_lengths, strict=True)):
+            prompt_attention_mask[index, -prompt_length:] = 1
+            response_attention_mask[index, :response_length] = 1
+        rollout_batch.batch["prompts"] = prompts
+        rollout_batch.batch["responses"] = responses
+        rollout_batch.batch["input_ids"] = torch.cat([prompts, responses], dim=1)
+        rollout_batch.batch["attention_mask"] = torch.cat(
+            [prompt_attention_mask, response_attention_mask],
+            dim=1,
+        )
+        rollout_batch.batch["world_loss_mask"] = rollout_batch.batch["world_loss_mask"].to_padded_tensor(
+            padding=0,
+            output_size=(len(batch), response_width),
+        )
+        future = self._dump_executor.submit(
+            self._write_rollout_batch,
+            rollout_batch,
+            dump_path,
+            self.global_steps,
+            self.local_trigger_step,
+            self.parameter_sync_step,
+        )
+        self._dump_futures.append(future)
+        still_pending = []
+        for pending in self._dump_futures:
+            if pending.done():
+                pending.result()
+            else:
+                still_pending.append(pending)
         self._dump_futures = still_pending
 
     def _init_dump_executor(self):
@@ -1669,6 +2279,36 @@ class PPOTrainer(ABC):
 
         return batch
 
+    def _update_world_model(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+        """Update the separate world model with observation-token CE."""
+        world_model_config = self.config.world_model_actor.actor
+        world_model_batch = copy.copy(batch)
+        world_model_batch.extra_info = dict(batch.extra_info)
+        ppo_mini_batch_size = world_model_config.ppo_mini_batch_size
+        ppo_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+        world_model_batch.extra_info.update(
+            {
+                "calculate_entropy": False,
+                "distillation_use_topk": False,
+                "distillation_only": False,
+                "global_batch_size": ppo_mini_batch_size,
+                "mini_batch_size": ppo_mini_batch_size,
+                "epochs": world_model_config.ppo_epochs,
+                "seed": world_model_config.data_loader_seed,
+                "dataloader_kwargs": {"shuffle": world_model_config.shuffle},
+                "compute_loss": True,
+                "multi_turn": self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                "temperature": 1.0,
+            }
+        )
+
+        output: TensorDict = self.world_model_wg.update_world_model(world_model_batch)
+        output = rename_dict(output["metrics"], "world_model/")
+        if "world_model/mfu" in output:
+            output["perf/mfu/world_model"] = output.pop("world_model/mfu")
+        metrics.update(reduce_metrics(output))
+        return batch
+
     def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Update the actor network."""
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
@@ -1742,16 +2382,26 @@ class PPOTrainer(ABC):
         min_global_steps = np.array([tag["min_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
         max_global_steps = np.array([tag["max_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
 
+        extra_data = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["extra_fields"],
+        )
+        extra_fields = extra_data.pop("extra_fields").tolist()
+        per_sample_agent_metrics = np.array(
+            [
+                extra_field.get("agent_metrics") if isinstance(extra_field, dict) else None
+                for extra_field in extra_fields
+            ],
+            dtype=object,
+        )
+        if non_padding_mask.any():
+            per_sample_agent_metrics = per_sample_agent_metrics[non_padding_mask]
+
         # Only fetch speculative decoding stats when rollout writes them.
         spec_drafts = spec_accepts = spec_verifies = None
         mtp_config = getattr(self.config.actor_rollout_ref.model, "mtp", None)
         if mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout:
-            spec_data = tq.kv_batch_get(
-                keys=batch.keys,
-                partition_id=batch.partition_id,
-                select_fields=["extra_fields"],
-            )
-            extra_fields = spec_data.pop("extra_fields").tolist()
             # The rollout omits the spec_* stats when the backend does not report
             # per-request spec-decode stats; leave all three as None in that case.
             if extra_fields and all(
@@ -1781,6 +2431,11 @@ class PPOTrainer(ABC):
             )
         )
         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+        metrics.update(
+            compute_agent_loop_metrics(
+                DataProto(non_tensor_batch={"agent_metrics": per_sample_agent_metrics}),
+            )
+        )
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self._get_n_gpus_for_throughput()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))

@@ -124,11 +124,16 @@ class TaskRunnerV1:
         else:
             agent_loop_manager_cls = AgentLoopManagerTQ
 
+        manager_kwargs = {}
+        wm_client = self.trainer.get_wm_client()
+        if wm_client is not None:
+            manager_kwargs["wm_client"] = wm_client
         self.agent_loop_manager = agent_loop_manager_cls.create(
             config=self.config,
             llm_client=self.trainer.get_llm_client(),
             teacher_client=self.trainer.get_teacher_client(),
             reward_loop_worker_handles=self.trainer.get_reward_handles(),
+            **manager_kwargs,
         )
 
     def run(self, config: DictConfig):

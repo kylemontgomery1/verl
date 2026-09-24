@@ -229,6 +229,7 @@ class AgentLoopBase(ABC):
         self.config = trainer_config.config
         self.rollout_config = self.config.actor_rollout_ref.rollout
         self.server_manager = server_manager
+        self.wm_server_manager = kwargs.get("wm_server_manager")
         self.tokenizer = tokenizer
         self.processor = processor
         self.dataset_cls = dataset_cls
@@ -510,11 +511,13 @@ class AgentLoopWorker:
         llm_client: LLMServerClient,
         teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        wm_client: LLMServerClient = None,
     ):
         self.config = config
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self.wm_client = wm_client
 
         rollout_config, model_config = config.actor_rollout_ref.rollout, config.actor_rollout_ref.model
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_config)
@@ -694,6 +697,7 @@ class AgentLoopWorker:
             )
 
             agent_loop_config = _agent_loop_registry[agent_name]
+            extra_kwargs = {"wm_server_manager": self.wm_client} if self.wm_client is not None else {}
             agent_loop = hydra.utils.instantiate(
                 config=agent_loop_config,
                 trainer_config=DictConfigWrap(config=self.config),
@@ -703,8 +707,15 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
+                **extra_kwargs,
             )
+            agent_loop._global_steps = trajectory["step"]
+            agent_loop._validate = trajectory["validate"]
+            report_eval = trajectory["validate"] and self.config.trainer.get("eval_report_level", "off") != "off"
+            rollout_started_at = asyncio.get_running_loop().time() if report_eval else None
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            if rollout_started_at is not None:
+                output.extra_fields["rollout_wall_sec"] = asyncio.get_running_loop().time() - rollout_started_at
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
@@ -1091,6 +1102,17 @@ class AgentLoopWorker:
             rm_scores[torch.arange(response_mask.size(0)), response_length] = torch.tensor(scores, dtype=torch.float32)
             batch["rm_scores"] = rm_scores
 
+        world_loss_lists = [input.extra_fields.pop("world_loss_masks", None) for input in inputs]
+        if any(mask is not None for mask in world_loss_lists):
+            mask_response_length = response_mask.size(1)
+            world_loss_mask = torch.zeros(len(inputs), mask_response_length, dtype=torch.float32)
+            for index, mask in enumerate(world_loss_lists):
+                if not mask:
+                    continue
+                length = min(len(mask), mask_response_length)
+                world_loss_mask[index, :length] = torch.tensor(mask[:length], dtype=torch.float32)
+            batch["world_loss_mask"] = world_loss_mask
+
         non_tensor_batch = {
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
@@ -1179,6 +1201,7 @@ class AgentLoopManager:
         llm_client: LLMServerClient,
         teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        wm_client: LLMServerClient = None,
     ):
         self.config = config
         self.rollout_config = config.actor_rollout_ref.rollout
@@ -1186,6 +1209,7 @@ class AgentLoopManager:
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self.wm_client = wm_client
 
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
@@ -1217,6 +1241,7 @@ class AgentLoopManager:
                     self.llm_client,
                     self.teacher_client,
                     self.reward_loop_worker_handles,
+                    wm_client=self.wm_client,
                 )
             )
 

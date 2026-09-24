@@ -144,6 +144,37 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return policy_loss, metrics
 
 
+def world_model_ce_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+    """Compute next-token CE only on environment observation tokens."""
+    log_prob = no_padding_2_padding(model_output["log_probs"], data)
+
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+
+    if (
+        data["dp_size"] > 1
+        or data["batch_num_tokens"] is not None
+        or data["global_batch_size"] is not None
+        or config.loss_scale_factor is not None
+    ):
+        metric_aggregation = AggregationType.SUM
+    else:
+        metric_aggregation = AggregationType.MEAN
+
+    data = data.select("world_loss_mask").to_padded_tensor()
+    world_loss_mask = data["world_loss_mask"].to(log_prob.dtype)
+    ce_loss = agg_loss(
+        loss_mat=-log_prob,
+        loss_mask=world_loss_mask,
+        loss_agg_mode=config.loss_agg_mode,
+        **config.global_batch_info,
+    )
+    metrics = {"ce_loss": Metric(value=ce_loss, aggregation=metric_aggregation)}
+    return ce_loss, metrics
+
+
 def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=None):
     """value loss
 

@@ -181,6 +181,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         # - index: index of agent loop output
         keys, fields, tags = [], [], []
         for i, output in enumerate(outputs):
+            world_loss_masks = output.extra_fields.pop("world_loss_masks", None)
             prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
             responses = torch.tensor(output.response_ids, dtype=torch.int64)
             input_ids = torch.cat([prompts, responses], dim=0)
@@ -200,6 +201,8 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             field["input_ids"] = input_ids
             field["position_ids"] = position_ids
             field["multi_modal_inputs"] = multi_modal_inputs
+            if world_loss_masks is not None:
+                field["world_loss_mask"] = torch.tensor(world_loss_masks, dtype=torch.float32)
             fields.append(field)
             prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
             tags.append(
@@ -230,6 +233,7 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 class AgentLoopManagerTQ(AgentLoopManager):
     def __init__(self, *args, **kwargs):
         self.agent_loop_workers_class = AgentLoopWorkerTQ
+        self._round_robin_worker_index = 0
         super().__init__(*args, **kwargs)
 
     @classmethod
@@ -253,5 +257,25 @@ class AgentLoopManagerTQ(AgentLoopManager):
             [
                 worker.generate_sequences.remote(chunk)
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
+            ]
+        )
+
+    def generate_sequences_round_robin(self, prompts: TensorDict) -> None:
+        """Dispatch prompts round-robin without changing the default chunked path."""
+        num_workers = len(self.agent_loop_workers)
+        if num_workers == 0:
+            raise RuntimeError("No agent loop workers are available")
+
+        worker_indices: list[list[int]] = [[] for _ in range(num_workers)]
+        for prompt_index in range(len(prompts)):
+            worker_index = (self._round_robin_worker_index + prompt_index) % num_workers
+            worker_indices[worker_index].append(prompt_index)
+        self._round_robin_worker_index = (self._round_robin_worker_index + len(prompts)) % num_workers
+
+        ray.get(
+            [
+                worker.generate_sequences.remote(prompts[indices])
+                for worker, indices in zip(self.agent_loop_workers, worker_indices, strict=True)
+                if indices
             ]
         )

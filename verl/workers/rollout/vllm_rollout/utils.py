@@ -406,13 +406,15 @@ class vLLMColocateWorkerExtension:
         VERL_ZMQ_BASE_TRAINER_RANK offset maps them back to trainer ranks.
         """
         replica_rank = os.environ.get("VERL_REPLICA_RANK", "0")
+        namespace = os.environ.get("VERL_REPLICA_NAMESPACE", "")
+        namespace = f"-{namespace}" if namespace else ""
         job_id = os.environ.get("VERL_RAY_JOB_ID", "0")
         vllm_config = getattr(self.model_runner, "vllm_config", None)
         parallel_config = getattr(vllm_config, "parallel_config", None)
         local_rank = _resolve_vllm_weight_sync_local_rank(self.local_rank, parallel_config)
         trainer_rank_base = os.environ.get("VERL_ZMQ_BASE_TRAINER_RANK")
         trainer_rank = int(trainer_rank_base) + local_rank if trainer_rank_base is not None else local_rank
-        return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{trainer_rank}.sock"
+        return f"ipc:///tmp/rl-colocate-zmq-{job_id}{namespace}-replica-{replica_rank}-rank-{trainer_rank}.sock"
 
 
 class SuppressSignalInThread:

@@ -38,6 +38,7 @@ class Role(Enum):
     ActorRolloutRef = 6
     Env = 7
     TeacherModel = 8
+    WorldModel = 9
 
     def __str__(self):
         return self._get_role_string()
@@ -52,6 +53,7 @@ class Role(Enum):
             Role.RewardModel: "rm",
             Role.ActorRolloutRef: "actor_rollout_ref",
             Role.TeacherModel: "teacher",
+            Role.WorldModel: "world_model",
         }
         return role_mapping.get(self, self.name.lower())
 
@@ -65,6 +67,7 @@ class Role(Enum):
             "ref": cls.RefPolicy,
             "rm": cls.RewardModel,
             "actor_rollout_ref": cls.ActorRolloutRef,
+            "world_model": cls.WorldModel,
         }
         role = string_mapping.get(name.lower())
         if role is None:
@@ -91,6 +94,12 @@ def need_reward_model(
 ) -> bool:
     """Given the config, do we need reward model."""
     return config.reward.reward_model.enable
+
+
+def need_separated_world_model(config: DictConfig) -> bool:
+    """Whether to train a distinct world-model actor."""
+    world_model = config.get("world_model_actor")
+    return bool(world_model is not None and world_model.get("enable", False))
 
 
 def need_critic(config: DictConfig) -> bool:

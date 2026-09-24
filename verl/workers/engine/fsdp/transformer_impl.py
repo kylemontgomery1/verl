@@ -680,7 +680,10 @@ class FSDPEngine(BaseEngine):
         micro-batch to a single round, at the cost of temporarily retaining
         unsharded gradients until the final backward.
         """
-        if is_last_micro_batch:
+        defer_gradient_sync = getattr(
+            getattr(self, "engine_config", None), "defer_gradient_sync", True
+        )
+        if is_last_micro_batch or not defer_gradient_sync:
             yield
             return
 

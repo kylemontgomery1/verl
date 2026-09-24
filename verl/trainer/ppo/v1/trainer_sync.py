@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from verl.trainer.ppo.v1.trainer_base import PPOTrainer, register_trainer
 from verl.utils.debug import marked_timer
@@ -30,13 +31,28 @@ class PPOTrainerSync(PPOTrainer):
 
     def on_init_end(self):
         # update weights after loading checkpoint
-        self.checkpoint_manager.update_weights(self.global_steps)
+        self._sync_rollout_weights()
 
     def on_step_end(self):
         with marked_timer("update_weights", self.timing_raw, color="red"):
             # wake up all replicas to update weights
-            self.checkpoint_manager.update_weights(self.global_steps)
+            self._sync_rollout_weights()
 
     def on_sample_end(self):
         # sleep all replicas to discard weights and kv cache
-        self.checkpoint_manager.sleep_replicas()
+        if not self.use_separated_world_model:
+            self.checkpoint_manager.sleep_replicas()
+            return
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            world_model_future = executor.submit(self.wm_checkpoint_manager.sleep_replicas)
+            self.checkpoint_manager.sleep_replicas()
+            world_model_future.result()
+
+    def _sync_rollout_weights(self):
+        if not self.use_separated_world_model:
+            self.checkpoint_manager.update_weights(self.global_steps)
+            return
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            world_model_future = executor.submit(self.wm_checkpoint_manager.update_weights, self.global_steps)
+            self.checkpoint_manager.update_weights(self.global_steps)
+            world_model_future.result()
